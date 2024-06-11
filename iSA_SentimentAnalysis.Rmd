@@ -1,0 +1,210 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+# Sentiment Analysis with iSA
+
+To use iSA, it is necessary to download the model from GitHub.
+
+```{r}
+# install_github("blogsvoices/iSAX")
+```
+
+I start by importing the libraries.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(tidytext)
+library(tinytex)
+library(dplyr)
+library(plyr)
+library(textdata)
+library(tidyverse)
+library(tm)
+library(devtools)
+library(BMS)
+library(quadprog)
+library(rJava)
+library(parallel)
+library(data.table)
+library(entropy)
+library(iSAX)
+library(ggplot2)
+```
+
+Now, I load the tagged and untagged data resulting from the pre-processing done in the Python notebook. I save the untagged data in 'data_no_tag' and the tagged data in 'data_tag'. Additionally, I set the 'Sentiment' column of the untagged data to NA. Finally, I combine everything into the 'data' dataset.
+
+```{r}
+path_no_tag <- "YOUR PATH TO NO_TAG DF"
+data_no_tag <- read.csv(path_no_tag)
+y_pre_bert <- data_no_tag$Sentiment
+data_no_tag$Sentiment <- ""
+data_no_tag$Sentiment <- na_if(data_no_tag$Sentiment, "")
+
+path_tag <- "YOUR PATH TO TAG DF"
+data_tag <- read.csv(path_tag) 
+data_tag$Sentiment <- mapvalues(data_tag$Sentiment,
+                                from = c(2, 0, 1),
+                                to = c("positive", "negative", "neutral"))
+
+data <- bind_rows(data_no_tag, data_tag)
+data <- select(data, school, Sentiment, text_clean)
+head(data[, c("school", "text_clean")], 3)
+```
+
+## Text the procedure on the Global Sentiment
+
+Prepare the data
+```{r}
+corpus <- VectorSource(data$text_clean) %>% VCorpus %>% prep.data(., train = data$school)
+
+tr <- data$Sentiment
+S <- corpus$S
+dtm <- corpus$dtm
+dtm <- dtm %>%  as_tibble() %>% mutate(D = factor(tr))
+```
+
+Divide the data according to whether they have the encoding or not
+```{r}
+notag <- which(is.na(tr))
+Snotag <- S[notag]
+Stag <- S[-notag]
+D <- tr[-notag]
+dtm.notag <- dtm %>% filter(is.na(D))
+dtm.tag <- dtm %>% filter(!is.na(D))
+```
+
+To test the procedure I pretend to have only tagged texts that I divide into two disjoint sets
+```{r}
+ptop.tag <- prop.table(table(D))
+n.tag <- length(D)
+set.seed(123)
+random <- sample(1:n.tag, n.tag/2)
+Strain <- Stag[random]
+Stest <- Stag[-random]
+Dtrain <- D[random]
+Dtest <- D[-random]
+dtm.train <- dtm.tag %>% slice(random)
+dtm.test <- dtm.tag %>% slice(-random)
+```
+
+Run the algorithm
+```{r include=FALSE}
+res0 <- iSA(Strain, Stest, Dtrain, seqlen=0, nboot=100)
+```
+
+Check the results
+```{r}
+true.test <- prop.table(table(Dtest))
+cbind(true.test, res0$est)
+```
+
+The two columns look quite similar, this indicates that the estimate is good
+
+## Sentiment Analysis for each School
+
+Now, I will start with a brief preprocessing operation to ensure that the model receives the data in the correct format. The function 'prep.data()' returns 4 elements; we are interested in the vector 'S', which contains the stemmed text, and the object 'dtm', which is the document-term matrix.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# Get the list of unique schools
+unique_schools <- unique(data$school)
+
+# Create a list to store the results for each school
+schools_results <- list()
+
+# Create a list to store the time results of iSA
+execution_time <- list()
+
+# Iterate through each school and apply iSA to the corresponding data
+for (school in unique_schools) {
+  # Filter the data for the current school
+  school_data <- data[data$school == school, ]
+  
+  # Prepare the data for iSA --> take a bite time
+  corpus <- VectorSource(school_data$text_clean) %>% VCorpus %>% prep.data(., train = school_data$school)
+  tr <- school_data$Sentiment
+  S <- corpus$S
+  dtm <- corpus$dtm
+  notag <- which(is.na(tr))
+  Snotag <- S[notag]
+  Stag <- S[-notag]
+  D <- tr[-notag]
+  
+  start_time <- Sys.time()
+  # Execute iSA, estimate the sentiment
+  results <- iSA(Stag, Snotag, D, seqlen=0, nboot=100)
+  end_time <- Sys.time()
+  
+  # Store the results for this school
+  schools_results[[school]] <- results$est
+  execution_time[[school]] <- end_time - start_time
+}
+```
+
+Now print the total execution time in seconds
+
+```{r}
+execution_time %>% 
+  unlist(.) %>% 
+  as.numeric(.) %>% 
+  sum(.) %>% 
+  print(.)
+```
+
+This code chunk combines sentiment analysis results for all schools, calculates the difference between positive and negative sentiments for each school and generates a histogram showing the difference between positive and negative sentiments per school using the custom color scale.
+
+```{r}
+# Combine the results for all schools
+results_df <- do.call(rbind, lapply(names(schools_results), function(school) {
+  data.frame(school = school, sentiment = schools_results[[school]])
+}))
+
+# Split the data frame by school
+results_list <- split(results_df, f = results_df$school)
+
+final_list <- list()
+
+for (school in names(results_list)) {
+  pos <- results_list[[school]]$iSA[3]
+  neg <- results_list[[school]]$iSA[1]
+  final_list[[school]] <- pos - neg
+}
+
+# Convert final_list to a data frame
+final_df <- data.frame(school = names(final_list), difference = unlist(final_list))
+final_df <- final_df[order(final_df$difference, decreasing = TRUE), ]
+```
+
+Plot the results
+```{r}
+# Define a custom color palette
+custom_palette <- rev(c("#472563", "#4b3b75", "#494e7f", "#415d82", "#3a6a82", "#347681", "#2f837f", "#2f917e", "#3da17a", "#59b273", "#7bc065", "#9ac64d", "#bbc935"))
+
+# Create the histogram with the custom color scale and specified y-axis limits and breaks
+p <- ggplot(final_df, aes(x = reorder(school, -difference), y = difference)) +
+  geom_bar(stat = "identity", aes(fill = difference), width=0.8) +
+  scale_fill_gradientn(colors = custom_palette) +
+  labs(title = "Difference between Positive and Negative Sentiments per School",
+       x = "School",
+       y = "Positive - Negative Sentiment") +
+  scale_y_continuous(limits = c(0, 0.45), breaks = seq(0.0, 0.6, by = 0.1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major = element_blank(),  # Remove major grid lines
+        panel.grid.minor = element_blank(),  # Remove minor grid lines
+        panel.background = element_rect(fill = "white", color = "white"),  # Set background to white
+        plot.background = element_rect(fill = "white", color = "white"),  # Set plot background to white
+        panel.border = element_blank(),  # Remove the default panel border
+        legend.position = "none")  # Remove the legend
+
+num_schools <- length(unique(final_df$school)) - 1
+line_positions <- seq(0.5, num_schools + 0.5, by = 1)
+# Draw a black rectangle around the plot area
+p + 
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 0, ymax = Inf), 
+            color = "black", fill = NA, size = 0.5) +
+  #geom_segment(aes(x = line_positions, xend = line_positions, y = 0, yend = -0.02), color = "black", size = 0.7) +
+  theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"))  # Adjust plot margins if necessary
+```
+
+
